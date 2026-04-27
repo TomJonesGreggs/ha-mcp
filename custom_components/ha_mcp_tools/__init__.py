@@ -28,7 +28,9 @@ from ruamel.yaml import YAMLError
 
 from .const import (
     ALLOWED_READ_DIRS,
+    ALLOWED_READ_PATTERNS,
     ALLOWED_WRITE_DIRS,
+    ALLOWED_WRITE_PATTERNS,
     ALLOWED_YAML_CONFIG_FILES,
     ALLOWED_YAML_KEYS,
     DOMAIN,
@@ -100,10 +102,30 @@ ALLOWED_READ_FILES = [
 DEFAULT_LOG_TAIL_LINES = 1000
 
 
+def _path_within_pattern_coverage(rel_path: str, pattern: str) -> bool:
+    """Check if rel_path is covered by an fnmatch pattern.
+
+    Returns True if either:
+    - rel_path matches the pattern directly (file case), or
+    - rel_path is the literal directory prefix of the pattern, or sits
+      inside that prefix (i.e. listing a directory containing pattern matches).
+    """
+    if fnmatch.fnmatch(rel_path, pattern):
+        return True
+    # Treat everything before the first wildcard as a literal directory prefix
+    literal_prefix = pattern.split("*", 1)[0].rstrip("/")
+    if not literal_prefix:
+        return False
+    return rel_path == literal_prefix or rel_path.startswith(literal_prefix + "/")
+
+
 def _is_path_allowed_for_dir(
-    config_dir: Path, rel_path: str, allowed_dirs: list[str]
+    config_dir: Path,
+    rel_path: str,
+    allowed_dirs: list[str],
+    allowed_patterns: list[str] | None = None,
 ) -> bool:
-    """Check if a path is within allowed directories."""
+    """Check if a path is within allowed directories or matches an allowed pattern."""
     # Normalize the path
     normalized = os.path.normpath(rel_path)
 
@@ -111,19 +133,28 @@ def _is_path_allowed_for_dir(
     if normalized.startswith("..") or normalized.startswith("/"):
         return False
 
-    # Check if path starts with an allowed directory
-    parts = normalized.split(os.sep)
-    if not parts or parts[0] not in allowed_dirs:
-        return False
-
     # Resolve full path and verify it's still under config_dir
     full_path = config_dir / normalized
     try:
         resolved = full_path.resolve()
         config_resolved = config_dir.resolve()
-        return str(resolved).startswith(str(config_resolved))
+        if not str(resolved).startswith(str(config_resolved)):
+            return False
     except (OSError, ValueError):
         return False
+
+    # Check if path starts with an allowed top-level directory
+    parts = normalized.split(os.sep)
+    if parts and parts[0] in allowed_dirs:
+        return True
+
+    # Check if path is covered by any allowed pattern (file match or parent dir)
+    if allowed_patterns:
+        for pattern in allowed_patterns:
+            if _path_within_pattern_coverage(normalized, pattern):
+                return True
+
+    return False
 
 
 def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
@@ -133,6 +164,7 @@ def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
     - Files directly in config dir: configuration.yaml, automations.yaml, etc.
     - Files in allowed directories: www/, themes/, custom_templates/
     - Files matching patterns: packages/*.yaml, custom_components/**/*.py
+    - Files matching local-fork patterns in ALLOWED_READ_PATTERNS
     """
     normalized = os.path.normpath(rel_path)
 
@@ -164,6 +196,11 @@ def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
         return True
     if fnmatch.fnmatch(normalized, "packages/**/*.yaml"):
         return True
+
+    # Check for any local-fork allowed read pattern
+    for pattern in ALLOWED_READ_PATTERNS:
+        if fnmatch.fnmatch(normalized, pattern):
+            return True
 
     # Check for custom_components/**/*.py pattern
     return fnmatch.fnmatch(normalized, "custom_components/**/*.py")
@@ -208,11 +245,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         pattern = call.data.get("pattern")
 
         # Security check
-        if not _is_path_allowed_for_dir(config_dir, rel_path, ALLOWED_READ_DIRS):
+        if not _is_path_allowed_for_dir(
+            config_dir, rel_path, ALLOWED_READ_DIRS, ALLOWED_READ_PATTERNS
+        ):
             _LOGGER.warning("Attempted to list files in disallowed path: %s", rel_path)
             return {
                 "success": False,
-                "error": f"Path not allowed. Must be in: {', '.join(ALLOWED_READ_DIRS)}",
+                "error": (
+                    f"Path not allowed. Must be in: {', '.join(ALLOWED_READ_DIRS)}"
+                    f" or match: {', '.join(ALLOWED_READ_PATTERNS)}"
+                ),
                 "files": [],
             }
 
@@ -384,11 +426,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         create_dirs = call.data.get("create_dirs", True)
 
         # Security check - only allow writes to specific directories
-        if not _is_path_allowed_for_dir(config_dir, rel_path, ALLOWED_WRITE_DIRS):
+        if not _is_path_allowed_for_dir(
+            config_dir, rel_path, ALLOWED_WRITE_DIRS, ALLOWED_WRITE_PATTERNS
+        ):
             _LOGGER.warning("Attempted to write to disallowed path: %s", rel_path)
             return {
                 "success": False,
-                "error": f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}",
+                "error": (
+                    f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
+                    f" or match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                ),
             }
 
         target_file = config_dir / rel_path
@@ -452,11 +499,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         rel_path = call.data["path"]
 
         # Security check - only allow deletes from specific directories
-        if not _is_path_allowed_for_dir(config_dir, rel_path, ALLOWED_WRITE_DIRS):
+        if not _is_path_allowed_for_dir(
+            config_dir, rel_path, ALLOWED_WRITE_DIRS, ALLOWED_WRITE_PATTERNS
+        ):
             _LOGGER.warning("Attempted to delete from disallowed path: %s", rel_path)
             return {
                 "success": False,
-                "error": f"Delete not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}",
+                "error": (
+                    f"Delete not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
+                    f" or match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                ),
             }
 
         target_file = config_dir / rel_path
