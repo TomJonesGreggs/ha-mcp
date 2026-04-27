@@ -6,6 +6,29 @@ DOMAIN = "ha_mcp_tools"
 ALLOWED_READ_DIRS = ["www", "themes", "custom_templates"]
 ALLOWED_WRITE_DIRS = ["www", "themes", "custom_templates"]
 
+# Additional fnmatch patterns for paths allowed beyond the directory-level
+# allowlist. Use this for nested layouts (e.g. scripts in subfolders) without
+# opening up an entire top-level directory.
+# Note: Python's fnmatch treats `*` as matching across path separators, so
+# `scripts/*` covers arbitrarily nested files under scripts/.
+# Local-fork extension: this install has Python scripts at /config/scripts/
+# (legacy location for sure_api_poll.py) AND /config/config/scripts/ (doubled-
+# config quirk where vision/automation scripts live), web outputs at
+# /config/config/www/, and energy/derek/etc. blueprints at /config/blueprints/.
+ALLOWED_READ_PATTERNS = [
+    "scripts/*",          # /config/scripts/* — sure_api_poll.py + .log + .sure_last_poll
+    "config/scripts/*",   # /config/config/scripts/* — driveway/derek/litter/bin/energy_chart
+    "config/www/*",       # /config/config/www/* — vision script snapshots and outputs
+    "blueprints/*",       # /config/blueprints/* — energy + automation/script blueprints
+]
+
+ALLOWED_WRITE_PATTERNS = [
+    "scripts/*",
+    "config/scripts/*",
+    "config/www/*",
+    "blueprints/*",
+]
+
 # Files allowed for managed YAML editing
 ALLOWED_YAML_CONFIG_FILES = ["configuration.yaml"]
 # Also allows packages/*.yaml via pattern matching
