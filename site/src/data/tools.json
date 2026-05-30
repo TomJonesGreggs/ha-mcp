@@ -1042,6 +1042,45 @@
     "source_file": "tools_entities.py"
   },
   {
+    "name": "ha_append_file",
+    "title": "Append File",
+    "description": "Append text to a file, for content larger than one call can carry.\n\nA single ha_write_file caps near 55KB of content (the per-call argument\nlimit). To store a larger document, split it into chunks under ~50KB:\n  1. First chunk:            ha_append_file(path, chunk1, start_new=True)\n  2. Each subsequent chunk:  ha_append_file(path, chunkN)\n\nPass expected_sha256 per chunk (hash over that chunk's text) for an\nintegrity guarantee. Not for Tier 2 config files — use ha_write_file.",
+    "inputSchema": {
+      "properties": {
+        "path": {
+          "type": "Annotated[str, Field(description='Relative path from config directory. Same write allowlist as ha_write_file.')]"
+        },
+        "content": {
+          "type": "Annotated[str, Field(description='The text chunk to append.')]"
+        },
+        "start_new": {
+          "type": "Annotated[bool | str, Field(description='True for the FIRST chunk — creates/overwrites the file. False (default) appends to the existing file.')]",
+          "default": false
+        },
+        "create_dirs": {
+          "type": "Annotated[bool | str, Field(description='Create parent directories if missing.')]",
+          "default": true
+        },
+        "expected_sha256": {
+          "type": "Annotated[str | None, Field(description=\"Optional SHA-256 (hex) of THIS chunk's text. The server rejects the append if the chunk arrived truncated/altered — use it to guarantee large multi-chunk writes land intact.\")]",
+          "default": null
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "annotations": {
+      "destructiveHint": true
+    },
+    "tags": [
+      "Files",
+      "beta"
+    ],
+    "source_file": "tools_filesystem.py"
+  },
+  {
     "name": "ha_delete_file",
     "title": "Delete File",
     "description": "Delete a file from allowed directories in the Home Assistant config.\n\nPermanently removes a file from the allowed directories. This action\ncannot be undone.\n\n**Allowed Delete Directories:**\n- `www/` - Web assets\n- `themes/` - Theme files\n- `custom_templates/` - Template files\n\n**Security:**\n- Only the directories above allow deletions\n- Configuration files cannot be deleted\n- Path traversal (../) is blocked\n- Requires confirm=True to prevent accidents\n\n**Returns:**\n- success: Whether the operation succeeded\n- path: The file path that was deleted\n- message: Confirmation message\n\n**Example:**\n```python\n# Delete an old CSS file\nresult = ha_delete_file(\n    path=\"www/deprecated-style.css\",\n    confirm=True\n)\n```",
@@ -1141,6 +1180,22 @@
         "create_dirs": {
           "type": "Annotated[bool | str, Field(default=True, description=\"Whether to create parent directories if they don't exist. Default is True.\")]",
           "default": true
+        },
+        "dry_run": {
+          "type": "Annotated[bool | str, Field(description='Preview only — size delta + (YAML) parse status, no write.')]",
+          "default": false
+        },
+        "force_shrink": {
+          "type": "Annotated[bool | str, Field(description='Override the size-delta guard for legitimate large deletions.')]",
+          "default": false
+        },
+        "auto_revert": {
+          "type": "Annotated[bool | str, Field(description='For YAML/Tier 2 paths, auto-restore previous content if validation fails.')]",
+          "default": true
+        },
+        "expected_sha256": {
+          "type": "Annotated[str | None, Field(description='Optional SHA-256 (hex) of the full content; rejects the write if it arrived truncated.')]",
+          "default": null
         }
       },
       "required": [
