@@ -833,36 +833,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Phase 2: Tier 2 post-write check_config
             if is_tier_2 and result.get("success"):
                 try:
-                    check_result = await hass.services.async_call(
-                        "homeassistant", "check_config", {},
-                        blocking=True, return_response=True,
-                    )
-                    if isinstance(check_result, dict):
-                        errors = check_result.get("errors")
-                        if errors:
-                            result["config_check"] = "errors"
-                            result["config_check_errors"] = errors
-                            if auto_revert and old_content is not None:
-                                await _atomic_write_text(
-                                    hass, target_file, old_content,
-                                )
-                                result["auto_reverted"] = True
-                                result["success"] = False
-                                result["error"] = (
-                                    f"check_config failed after write; "
-                                    f"auto-reverted from in-memory snapshot. "
-                                    f"Errors: {errors}"
-                                )
-                                _LOGGER.warning(
-                                    "Auto-reverted %s: check_config errors: %s",
-                                    rel_path, errors,
-                                )
-                        else:
-                            result["config_check"] = "ok"
+                    _check = await async_check_ha_config_file(hass)
+                    _errors = [
+                        getattr(e, "message", str(e))
+                        for e in getattr(_check, "errors", [])
+                    ]
+                    if _errors:
+                        result["config_check"] = "errors"
+                        result["config_check_errors"] = _errors
+                        if auto_revert and old_content is not None:
+                            await _atomic_write_text(hass, target_file, old_content)
+                            result["auto_reverted"] = True
+                            result["success"] = False
+                            result["error"] = (
+                                "check_config failed after write; auto-reverted "
+                                f"from in-memory snapshot. Errors: {_errors}"
+                            )
+                            _LOGGER.warning("Auto-reverted %s: %s", rel_path, _errors)
+                    else:
+                        result["config_check"] = "ok"
                 except Exception as check_err:  # noqa: BLE001
                     result["config_check"] = "unavailable"
                     result["config_check_error"] = str(check_err)
-                    _LOGGER.debug("Config check unavailable: %s", check_err)
 
             _LOGGER.info(
                 "Wrote file: %s (%d bytes, tier_2=%s, success=%s)",
@@ -1336,42 +1328,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             # Run HA config check
             try:
-                check_result = await hass.services.async_call(
-                    "homeassistant", "check_config", {},
-                    blocking=True, return_response=True,
-                )
-                if isinstance(check_result, dict):
-                    errors = check_result.get("errors")
-                    if errors:
-                        result["config_check"] = "errors"
-                        result["config_check_errors"] = errors
-                        # Phase 2: auto-revert from raw_content snapshot
-                        if auto_revert and raw_content:
-                            await _atomic_write_text(
-                                hass, target_file, raw_content,
-                            )
-                            result["auto_reverted"] = True
-                            result["success"] = False
-                            result["error"] = (
-                                f"check_config failed after edit; auto-reverted "
-                                f"from in-memory snapshot. Errors: {errors}"
-                            )
-                            _LOGGER.warning(
-                                "Auto-reverted %s: check_config errors: %s",
-                                rel_path, errors,
-                            )
-                        else:
-                            _LOGGER.warning(
-                                "Config check found errors after editing %s "
-                                "(auto_revert=%s): %s",
-                                rel_path, auto_revert, errors,
-                            )
-                    else:
-                        result["config_check"] = "ok"
+                _check = await async_check_ha_config_file(hass)
+                _errors = [
+                    getattr(e, "message", str(e))
+                    for e in getattr(_check, "errors", [])
+                ]
+                if _errors:
+                    result["config_check"] = "errors"
+                    result["config_check_errors"] = _errors
+                    if auto_revert and raw_content is not None:
+                        await _atomic_write_text(hass, target_file, raw_content)
+                        result["auto_reverted"] = True
+                        result["success"] = False
+                        result["error"] = (
+                            "check_config failed after write; auto-reverted from "
+                            f"in-memory snapshot. Errors: {_errors}"
+                        )
+                        _LOGGER.warning("Auto-reverted %s: %s", rel_path, _errors)
+                else:
+                    result["config_check"] = "ok"
             except Exception as check_err:  # noqa: BLE001
                 result["config_check"] = "unavailable"
                 result["config_check_error"] = str(check_err)
-                _LOGGER.debug("Config check unavailable: %s", check_err)
 
             await _audit_write(
                 hass, config_dir,
