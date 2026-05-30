@@ -353,6 +353,22 @@ class FilesystemTools:
                 ),
             ),
         ] = True,
+        dry_run: Annotated[
+            bool | str,
+            Field(description="Preview only — size delta + (YAML) parse status, no write."),
+        ] = False,
+        force_shrink: Annotated[
+            bool | str,
+            Field(description="Override the size-delta guard for legitimate large deletions."),
+        ] = False,
+        auto_revert: Annotated[
+            bool | str,
+            Field(description="For YAML/Tier 2 paths, auto-restore previous content if validation fails."),
+        ] = True,
+        expected_sha256: Annotated[
+            str | None,
+            Field(description="Optional SHA-256 (hex) of the full content; rejects the write if it arrived truncated."),
+        ] = None,
     ) -> dict[str, Any]:
         """Write a file to allowed directories in the Home Assistant config.
 
@@ -398,6 +414,9 @@ class FilesystemTools:
             # Coerce boolean parameters
             overwrite_bool = coerce_bool_param(overwrite, "overwrite", default=False)
             create_dirs_bool = coerce_bool_param(create_dirs, "create_dirs", default=True)
+            dry_run_bool = coerce_bool_param(dry_run, "dry_run", default=False)
+            force_shrink_bool = coerce_bool_param(force_shrink, "force_shrink", default=False)
+            auto_revert_bool = coerce_bool_param(auto_revert, "auto_revert", default=True)
 
             # Check if custom component is available
             await _assert_mcp_tools_available(self._client)
@@ -408,7 +427,12 @@ class FilesystemTools:
                 "content": content,
                 "overwrite": overwrite_bool,
                 "create_dirs": create_dirs_bool,
+                "dry_run": dry_run_bool,
+                "force_shrink": force_shrink_bool,
+                "auto_revert": auto_revert_bool,
             }
+            if expected_sha256:
+                service_data["expected_sha256"] = expected_sha256
 
             # Call the custom component service
             result = await self._client.call_service(

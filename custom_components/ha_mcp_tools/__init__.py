@@ -111,6 +111,8 @@ SERVICE_WRITE_FILE_SCHEMA = vol.Schema(
         vol.Optional("dry_run", default=False): cv.boolean,
         vol.Optional("force_shrink", default=False): cv.boolean,
         vol.Optional("auto_revert", default=True): cv.boolean,
+        # Enhancement: optional content-integrity check
+        vol.Optional("expected_sha256"): cv.string,
     }
 )
 
@@ -632,6 +634,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 error="path_not_allowed",
             )
             return {"success": False, "error": error_msg}
+
+        # Enhancement: content-integrity guard (detects in-transit truncation)
+        _expected = call.data.get("expected_sha256")
+        _actual = _integrity_mismatch(content, _expected)
+        if _actual is not None:
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=None, new_size=len(content.encode("utf-8")),
+                success=False, is_tier_2=is_tier_2, dry_run=dry_run,
+                error="content_integrity_mismatch",
+            )
+            return {
+                "success": False,
+                "error": (
+                    "Content integrity check failed: received content does not "
+                    "match expected_sha256 — likely truncated in transit. "
+                    "Nothing was written."
+                ),
+                "expected_sha256": _expected,
+                "actual_sha256": _actual,
+                "received_bytes": len(content.encode("utf-8")),
+            }
 
         target_file = config_dir / rel_path
 
