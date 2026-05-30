@@ -24,6 +24,7 @@ safe defaults.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from homeassistant.core import (
     SupportsResponse,
 )
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.check_config import async_check_ha_config_file
 from ruamel.yaml import YAMLError
 
 from .const import (
@@ -69,6 +71,7 @@ SERVICE_READ_FILE = "read_file"
 SERVICE_WRITE_FILE = "write_file"
 SERVICE_DELETE_FILE = "delete_file"
 SERVICE_EDIT_YAML_CONFIG = "edit_yaml_config"
+SERVICE_APPEND_FILE = "append_file"
 
 # Service schemas
 SERVICE_EDIT_YAML_CONFIG_SCHEMA = vol.Schema(
@@ -114,6 +117,16 @@ SERVICE_WRITE_FILE_SCHEMA = vol.Schema(
 SERVICE_DELETE_FILE_SCHEMA = vol.Schema(
     {
         vol.Required("path"): cv.string,
+    }
+)
+
+SERVICE_APPEND_FILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("path"): cv.string,
+        vol.Required("content"): cv.string,
+        vol.Optional("start_new", default=False): cv.boolean,
+        vol.Optional("create_dirs", default=True): cv.boolean,
+        vol.Optional("expected_sha256"): cv.string,
     }
 )
 
@@ -387,6 +400,20 @@ async def _atomic_write_text(
         os.replace(str(tmp_file), str(target_file))
 
     await hass.async_add_executor_job(_do_write)
+
+
+def _integrity_mismatch(content: str, expected_sha256: str | None) -> str | None:
+    """Return the actual sha256 hex if it does NOT match expected, else None.
+
+    The hash is computed by the caller over the *full intended* content. Because
+    it is a tiny 64-char field it survives the per-call argument-size limit even
+    when `content` itself is clipped in transit — so a truncated payload yields a
+    hash mismatch (a loud, catchable error) instead of a silently short file.
+    """
+    if not expected_sha256:
+        return None
+    actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return None if actual == expected_sha256.strip().lower() else actual
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -859,6 +886,133 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "error": str(err),
             }
 
+    async def handle_append_file(call: ServiceCall) -> ServiceResponse:
+        """Append a text chunk to a file, for building documents larger than a
+        single MCP call can carry (~55KB content ceiling per call).
+
+        First chunk: start_new=True (creates/overwrites). Later chunks:
+        start_new=False (appends). Atomic per call (read existing + concat +
+        os.replace), so a killed process never leaves a half-written file.
+        Tier 2 config files are rejected — they're small and need whole-file
+        validation, so use write_file for those.
+        """
+        rel_path = call.data["path"]
+        content = call.data["content"]
+        start_new = call.data.get("start_new", False)
+        create_dirs = call.data.get("create_dirs", True)
+        expected_sha256 = call.data.get("expected_sha256")
+
+        normalized = os.path.normpath(rel_path)  # noqa: ASYNC240
+        chunk_bytes = len(content.encode("utf-8"))
+
+        # Config files must be written whole, not appended.
+        if _is_tier_2(normalized):
+            return {
+                "success": False,
+                "error": (
+                    "append_file is not allowed for Tier 2 config files "
+                    f"({', '.join(sorted(WRITE_TIER_2_FILES))}). Use write_file."
+                ),
+            }
+
+        if not _is_path_allowed_for_write(config_dir, rel_path):
+            _LOGGER.warning("Attempted to append to disallowed path: %s", rel_path)
+            await _audit_write(
+                hass, config_dir,
+                service="append_file", path=rel_path,
+                old_size=None, new_size=None,
+                success=False, is_tier_2=False, dry_run=False,
+                error="path_not_allowed",
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
+                    f", match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                    f", or be one of: {', '.join(ALLOWED_WRITE_FILES)}"
+                ),
+            }
+
+        # Content-integrity guard: rejects a chunk that arrived truncated/altered.
+        actual_sha = _integrity_mismatch(content, expected_sha256)
+        if actual_sha is not None:
+            await _audit_write(
+                hass, config_dir,
+                service="append_file", path=rel_path,
+                old_size=None, new_size=chunk_bytes,
+                success=False, is_tier_2=False, dry_run=False,
+                error="content_integrity_mismatch",
+            )
+            return {
+                "success": False,
+                "error": (
+                    "Chunk integrity check failed: received content does not match "
+                    "expected_sha256 (likely truncated in transit). Nothing appended."
+                ),
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha,
+                "received_bytes": chunk_bytes,
+            }
+
+        target_file = config_dir / normalized
+        file_exists = target_file.exists()
+        old_size = target_file.stat().st_size if file_exists else 0
+
+        try:
+            if create_dirs:
+                await hass.async_add_executor_job(
+                    lambda: target_file.parent.mkdir(parents=True, exist_ok=True)
+                )
+            if not target_file.parent.exists():
+                return {
+                    "success": False,
+                    "error": (
+                        f"Parent directory does not exist: "
+                        f"{target_file.parent.relative_to(config_dir)}"
+                    ),
+                }
+
+            if start_new or not file_exists:
+                existing = ""
+            else:
+                existing = await hass.async_add_executor_job(target_file.read_text)
+            await _atomic_write_text(hass, target_file, existing + content)
+
+            stat = target_file.stat()
+            modified_dt = datetime.fromtimestamp(stat.st_mtime)
+            mode = "create" if (start_new or not file_exists) else "append"
+
+            await _audit_write(
+                hass, config_dir,
+                service="append_file", path=rel_path,
+                old_size=old_size, new_size=stat.st_size,
+                success=True, is_tier_2=False, dry_run=False,
+                extra={"mode": mode, "chunk_bytes": chunk_bytes},
+            )
+            _LOGGER.info(
+                "Appended to %s (chunk %d B, total %d B, mode=%s)",
+                rel_path, chunk_bytes, stat.st_size, mode,
+            )
+            return {
+                "success": True,
+                "path": rel_path,
+                "mode": mode,
+                "appended_bytes": chunk_bytes,
+                "size": stat.st_size,
+                "modified": modified_dt.isoformat(),
+            }
+
+        except PermissionError:
+            return {"success": False, "error": f"Permission denied: {rel_path}"}
+        except UnicodeDecodeError:
+            return {
+                "success": False,
+                "error": f"Existing file is not valid UTF-8 text: {rel_path}.",
+            }
+        except OSError as err:
+            _LOGGER.error("Error appending to %s: %s", rel_path, err)
+            return {"success": False, "error": str(err)}
+
     async def handle_delete_file(call: ServiceCall) -> ServiceResponse:
         """Handle the delete_file service call."""
         rel_path = call.data["path"]
@@ -1281,6 +1435,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_APPEND_FILE,
+        handle_append_file,
+        schema=SERVICE_APPEND_FILE_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     _LOGGER.info("HA MCP Tools initialized with file management services (Phase 2)")
     return True
 
@@ -1292,4 +1454,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, SERVICE_READ_FILE)
     hass.services.async_remove(DOMAIN, SERVICE_WRITE_FILE)
     hass.services.async_remove(DOMAIN, SERVICE_DELETE_FILE)
+    hass.services.async_remove(DOMAIN, SERVICE_APPEND_FILE)
     return True

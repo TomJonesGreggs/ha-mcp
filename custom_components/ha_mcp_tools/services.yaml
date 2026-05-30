@@ -146,3 +146,28 @@ delete_file:
       example: "www/old-file.css"
       selector:
         text:
+
+append_file:
+  name: Append File
+  description: >-
+    Append a text chunk to a file, for building documents larger than a single
+    call can carry. First chunk start_new=true; later chunks start_new=false.
+  fields:
+    path:
+      name: Path
+      required: true
+      example: "config/scripts/claude_context/big_doc.md"
+      selector: { text: }
+    content:
+      name: Content
+      required: true
+      selector: { text: { multiline: true } }
+    start_new:
+      name: Start new
+      description: "True to create/overwrite (first chunk); false to append."
+      default: false
+      selector: { boolean: }
+    expected_sha256:
+      name: Expected SHA-256
+      description: "Optional hex hash of this chunk for an integrity check."
+      selector: { text: }

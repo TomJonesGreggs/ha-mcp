@@ -438,6 +438,85 @@ class FilesystemTools:
             )
 
     @tool(
+        name="ha_append_file",
+        tags={"Files", "beta"},
+        annotations={"destructiveHint": True, "title": "Append File"},
+    )
+    @log_tool_usage
+    async def ha_append_file(
+        self,
+        path: Annotated[
+            str,
+            Field(description=(
+                "Relative path from config directory. Same write allowlist as "
+                "ha_write_file."
+            )),
+        ],
+        content: Annotated[str, Field(description="The text chunk to append.")],
+        start_new: Annotated[
+            bool | str,
+            Field(description=(
+                "True for the FIRST chunk — creates/overwrites the file. "
+                "False (default) appends to the existing file."
+            )),
+        ] = False,
+        create_dirs: Annotated[
+            bool | str,
+            Field(description="Create parent directories if missing."),
+        ] = True,
+        expected_sha256: Annotated[
+            str | None,
+            Field(description=(
+                "Optional SHA-256 (hex) of THIS chunk's text. The server rejects "
+                "the append if the chunk arrived truncated/altered — use it to "
+                "guarantee large multi-chunk writes land intact."
+            )),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Append text to a file, for content larger than one call can carry.
+
+        A single ha_write_file caps near 55KB of content (the per-call argument
+        limit). To store a larger document, split it into chunks under ~50KB:
+          1. First chunk:            ha_append_file(path, chunk1, start_new=True)
+          2. Each subsequent chunk:  ha_append_file(path, chunkN)
+
+        Pass expected_sha256 per chunk (hash over that chunk's text) for an
+        integrity guarantee. Not for Tier 2 config files — use ha_write_file.
+        """
+        try:
+            start_new_bool = coerce_bool_param(start_new, "start_new", default=False)
+            create_dirs_bool = coerce_bool_param(create_dirs, "create_dirs", default=True)
+            await _assert_mcp_tools_available(self._client)
+
+            service_data: dict[str, Any] = {
+                "path": path,
+                "content": content,
+                "start_new": start_new_bool,
+                "create_dirs": create_dirs_bool,
+            }
+            if expected_sha256:
+                service_data["expected_sha256"] = expected_sha256
+
+            result = await self._client.call_service(
+                MCP_TOOLS_DOMAIN, "append_file", service_data, return_response=True,
+            )
+            if isinstance(result, dict):
+                return unwrap_service_response(result)
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    "Unexpected response format from append_file service",
+                    context={"path": path},
+                )
+            )
+        except ToolError:
+            raise
+        except Exception as e:
+            exception_to_structured_error(
+                e, context={"tool": "ha_append_file", "path": path}
+            )
+
+    @tool(
         name="ha_delete_file",
         tags={"Files", "beta"},
         annotations={
