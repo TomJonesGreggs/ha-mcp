@@ -1,12 +1,30 @@
 """HA MCP Tools - Custom component for ha-mcp server.
 
-Provides services that are not available through standard Home Assistant APIs,
-enabling AI assistants to perform advanced operations like file management.
+PHASE 2 widening (2026-05-01) — adds safety machinery on top of the existing
+file-management services. New behaviours:
+
+- ALLOWED_WRITE_FILES (from const.py) — exact-filename allowlist for raw
+  ha_write_file writes to config-root files (CLAUDE.md, README.md, etc.)
+- WRITE_TIER_2_FILES (from const.py) — paths that trigger pre-write text
+  backup + post-write check_config validation + auto-revert on failure.
+- Size-delta guard on overwrites — refuses writes where the new content is
+  <50% of the old size, unless force_shrink=true is passed. Catches the
+  runaway-truncation class of bug.
+- dry_run parameter on both ha_write_file and ha_config_set_yaml — returns
+  a preview (size delta, parse status for YAML) without writing.
+- auto_revert parameter (default True) on Tier 2 raw writes and on YAML
+  config edits — restores from in-memory snapshot if validation fails.
+- Atomic writes everywhere (tmp file + os.replace).
+- Audit log at AUDIT_LOG_PATH (JSONL, rotates at AUDIT_LOG_MAX_BYTES).
+
+Existing callers continue to work without changes — all new parameters have
+safe defaults.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -30,10 +48,14 @@ from .const import (
     ALLOWED_READ_DIRS,
     ALLOWED_READ_PATTERNS,
     ALLOWED_WRITE_DIRS,
+    ALLOWED_WRITE_FILES,
     ALLOWED_WRITE_PATTERNS,
     ALLOWED_YAML_CONFIG_FILES,
     ALLOWED_YAML_KEYS,
+    AUDIT_LOG_MAX_BYTES,
+    AUDIT_LOG_PATH,
     DOMAIN,
+    WRITE_TIER_2_FILES,
     YAML_KEY_DEFAULT_POST_ACTION,
     YAML_KEY_POST_ACTIONS,
 )
@@ -56,6 +78,9 @@ SERVICE_EDIT_YAML_CONFIG_SCHEMA = vol.Schema(
         vol.Required("yaml_path"): cv.string,
         vol.Optional("content"): cv.string,
         vol.Optional("backup", default=True): cv.boolean,
+        # Phase 2 additions:
+        vol.Optional("dry_run", default=False): cv.boolean,
+        vol.Optional("auto_revert", default=True): cv.boolean,
     }
 )
 
@@ -79,6 +104,10 @@ SERVICE_WRITE_FILE_SCHEMA = vol.Schema(
         vol.Required("content"): cv.string,
         vol.Optional("overwrite", default=False): cv.boolean,
         vol.Optional("create_dirs", default=True): cv.boolean,
+        # Phase 2 additions:
+        vol.Optional("dry_run", default=False): cv.boolean,
+        vol.Optional("force_shrink", default=False): cv.boolean,
+        vol.Optional("auto_revert", default=True): cv.boolean,
     }
 )
 
@@ -100,6 +129,10 @@ ALLOWED_READ_FILES = [
 
 # Default tail lines for log files
 DEFAULT_LOG_TAIL_LINES = 1000
+
+# Phase 2: size-delta guard threshold. Overwrites where new size is below
+# this fraction of old size are rejected unless force_shrink=true.
+SIZE_DELTA_GUARD_THRESHOLD = 0.5
 
 
 def _path_within_pattern_coverage(rel_path: str, pattern: str) -> bool:
@@ -157,6 +190,46 @@ def _is_path_allowed_for_dir(
     return False
 
 
+def _is_path_allowed_for_write(config_dir: Path, rel_path: str) -> bool:
+    """Phase 2: combined write allowlist check.
+
+    Allows:
+    - Files in ALLOWED_WRITE_DIRS (www/, themes/, custom_templates/)
+    - Files matching ALLOWED_WRITE_PATTERNS (scripts/*, packages/*, etc.)
+    - Individual files in ALLOWED_WRITE_FILES (CLAUDE.md, README.md, etc.)
+
+    Path traversal is blocked. Files must resolve under config_dir even if
+    they reach via a symlink that points elsewhere.
+    """
+    # Existing dir + pattern coverage
+    if _is_path_allowed_for_dir(
+        config_dir, rel_path, ALLOWED_WRITE_DIRS, ALLOWED_WRITE_PATTERNS
+    ):
+        return True
+
+    # Phase 2: explicit file allowlist
+    normalized = os.path.normpath(rel_path)
+    if normalized.startswith("..") or normalized.startswith("/"):
+        return False
+
+    full_path = config_dir / normalized
+    try:
+        resolved = full_path.resolve()
+        config_resolved = config_dir.resolve()
+        if not str(resolved).startswith(str(config_resolved)):
+            return False
+    except (OSError, ValueError):
+        return False
+
+    return normalized in ALLOWED_WRITE_FILES
+
+
+def _is_tier_2(rel_path: str) -> bool:
+    """Phase 2: check if a path requires Tier 2 safety machinery."""
+    normalized = os.path.normpath(rel_path)
+    return normalized in WRITE_TIER_2_FILES
+
+
 def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
     """Check if a path is allowed for reading.
 
@@ -165,6 +238,7 @@ def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
     - Files in allowed directories: www/, themes/, custom_templates/
     - Files matching patterns: packages/*.yaml, custom_components/**/*.py
     - Files matching local-fork patterns in ALLOWED_READ_PATTERNS
+    - Audit log at AUDIT_LOG_PATH (Phase 2)
     """
     normalized = os.path.normpath(rel_path)
 
@@ -184,6 +258,13 @@ def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
 
     # Check if it's one of the explicitly allowed files in config root
     if normalized in ALLOWED_READ_FILES:
+        return True
+
+    # Phase 2: audit log readable so operators can review write history
+    if normalized == os.path.normpath(AUDIT_LOG_PATH):
+        return True
+    # Also allow rotated audit log
+    if normalized == os.path.normpath(AUDIT_LOG_PATH + ".1"):
         return True
 
     # Check if path starts with an allowed directory
@@ -207,32 +288,105 @@ def _is_path_allowed_for_read(config_dir: Path, rel_path: str) -> bool:
 
 
 def _mask_secrets_content(content: str) -> str:
-    """Mask secret values in secrets.yaml content.
-
-    Replaces actual values with [MASKED] to prevent leaking sensitive data.
-    """
-    # Pattern to match YAML key-value pairs
-    # Handles: key: value, key: "value", key: 'value'
+    """Mask secret values in secrets.yaml content."""
     lines = content.split("\n")
     masked_lines = []
 
     for line in lines:
-        # Skip comments and empty lines
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             masked_lines.append(line)
             continue
 
-        # Match key: value pattern
         match = re.match(r"^(\s*)([^:\s]+)(\s*:\s*)(.+)$", line)
         if match:
-            indent, key, separator, value = match.groups()
-            # Mask the value
+            indent, key, separator, _value = match.groups()
             masked_lines.append(f"{indent}{key}{separator}[MASKED]")
         else:
             masked_lines.append(line)
 
     return "\n".join(masked_lines)
+
+
+async def _audit_write(
+    hass: HomeAssistant,
+    config_dir: Path,
+    *,
+    service: str,
+    path: str,
+    old_size: int | None,
+    new_size: int | None,
+    success: bool,
+    is_tier_2: bool,
+    dry_run: bool,
+    error: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Phase 2: append a JSONL audit entry. Best-effort, never raises.
+
+    Audit log lives at config_dir / AUDIT_LOG_PATH (relative path defined
+    in const.py). Rotates to AUDIT_LOG_PATH + '.1' when crossing
+    AUDIT_LOG_MAX_BYTES (single-generation rotation).
+    """
+    audit_path = config_dir / AUDIT_LOG_PATH
+
+    def _write_entry() -> None:
+        entry: dict[str, Any] = {
+            "ts": datetime.now().isoformat(),
+            "service": service,
+            "path": path,
+            "old_size": old_size,
+            "new_size": new_size,
+            "delta": (
+                (new_size - old_size)
+                if (new_size is not None and old_size is not None)
+                else None
+            ),
+            "success": success,
+            "tier_2": is_tier_2,
+            "dry_run": dry_run,
+            "error": error,
+        }
+        if extra:
+            entry.update(extra)
+        try:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            # Rotate at threshold
+            if (
+                audit_path.exists()
+                and audit_path.stat().st_size > AUDIT_LOG_MAX_BYTES
+            ):
+                rotated = audit_path.with_suffix(audit_path.suffix + ".1")
+                if rotated.exists():
+                    rotated.unlink()
+                audit_path.rename(rotated)
+            with audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        except Exception as exc:  # noqa: BLE001 — audit log is best-effort
+            _LOGGER.debug("Audit log write failed (non-fatal): %s", exc)
+
+    try:
+        await hass.async_add_executor_job(_write_entry)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.debug("Audit log scheduling failed (non-fatal): %s", exc)
+
+
+async def _atomic_write_text(
+    hass: HomeAssistant, target_file: Path, content: str
+) -> None:
+    """Phase 2: atomic write via tmp file + os.replace.
+
+    Avoids the partial-write window that direct write_text has if the process
+    is killed mid-write. Tmp file lives next to the target so the rename is
+    cross-rename-safe (same filesystem).
+    """
+    tmp_file = target_file.parent / (target_file.name + ".tmp")
+
+    def _do_write() -> None:
+        tmp_file.write_text(content, encoding="utf-8")
+        os.replace(str(tmp_file), str(target_file))
+
+    await hass.async_add_executor_job(_do_write)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -244,7 +398,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         rel_path = call.data["path"]
         pattern = call.data.get("pattern")
 
-        # Security check
         if not _is_path_allowed_for_dir(
             config_dir, rel_path, ALLOWED_READ_DIRS, ALLOWED_READ_PATTERNS
         ):
@@ -277,7 +430,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             files = []
             for item in target_dir.iterdir():
-                # Apply pattern filter if provided
                 if pattern and not fnmatch.fnmatch(item.name, pattern):
                     continue
 
@@ -292,7 +444,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     }
                 )
 
-            # Sort by name
             files.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
 
             return {
@@ -323,7 +474,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         rel_path = call.data["path"]
         tail_lines = call.data.get("tail_lines")
 
-        # Security check
         if not _is_path_allowed_for_read(config_dir, rel_path):
             _LOGGER.warning("Attempted to read disallowed path: %s", rel_path)
             allowed_patterns = (
@@ -354,17 +504,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             stat = target_file.stat()
             modified_dt = datetime.fromtimestamp(stat.st_mtime)
 
-            # Read file content
             content = await hass.async_add_executor_job(target_file.read_text)
 
-            # Apply special handling for specific files
             normalized = os.path.normpath(rel_path)  # noqa: ASYNC240
 
-            # Mask secrets.yaml
             if normalized == "secrets.yaml":
                 content = _mask_secrets_content(content)
 
-            # Apply tail for log files
             if normalized == "home-assistant.log":
                 lines = content.split("\n")
                 limit = tail_lines if tail_lines else DEFAULT_LOG_TAIL_LINES
@@ -385,7 +531,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "truncated": truncated,
                 }
 
-            # Apply tail for other files if requested
             if tail_lines:
                 lines = content.split("\n")
                 if len(lines) > tail_lines:
@@ -419,76 +564,296 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
 
     async def handle_write_file(call: ServiceCall) -> ServiceResponse:
-        """Handle the write_file service call."""
+        """Handle the write_file service call.
+
+        Phase 2 enhancements:
+        - ALLOWED_WRITE_FILES check (e.g. CLAUDE.md, .gitignore)
+        - Tier 2 safety machinery for paths in WRITE_TIER_2_FILES
+        - Size-delta guard (>50% shrink rejected unless force_shrink=true)
+        - dry_run mode returns preview without writing
+        - Atomic write (tmp file + os.replace)
+        - YAML files: post-write parse validation + auto-revert on parse error
+        - Tier 2 paths: post-write check_config + auto-revert on errors
+        - JSONL audit log entry per write
+        """
         rel_path = call.data["path"]
         content = call.data["content"]
         overwrite = call.data.get("overwrite", False)
         create_dirs = call.data.get("create_dirs", True)
+        # Phase 2 parameters:
+        dry_run = call.data.get("dry_run", False)
+        force_shrink = call.data.get("force_shrink", False)
+        auto_revert = call.data.get("auto_revert", True)
 
-        # Security check - only allow writes to specific directories
-        if not _is_path_allowed_for_dir(
-            config_dir, rel_path, ALLOWED_WRITE_DIRS, ALLOWED_WRITE_PATTERNS
-        ):
+        normalized = os.path.normpath(rel_path)  # noqa: ASYNC240
+        is_tier_2 = _is_tier_2(normalized)
+        is_yaml = normalized.endswith((".yaml", ".yml"))
+
+        # Security check
+        if not _is_path_allowed_for_write(config_dir, rel_path):
             _LOGGER.warning("Attempted to write to disallowed path: %s", rel_path)
-            return {
-                "success": False,
-                "error": (
-                    f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
-                    f" or match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
-                ),
-            }
+            error_msg = (
+                f"Write not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
+                f", match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                f", or be one of: {', '.join(ALLOWED_WRITE_FILES)}"
+            )
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=None, new_size=None,
+                success=False, is_tier_2=is_tier_2, dry_run=dry_run,
+                error="path_not_allowed",
+            )
+            return {"success": False, "error": error_msg}
 
         target_file = config_dir / rel_path
 
-        # Check if file exists and overwrite is not allowed
-        if target_file.exists() and not overwrite:
+        # Capture existing-file state
+        file_exists = target_file.exists()
+        old_size = target_file.stat().st_size if file_exists else 0
+        new_size = len(content.encode("utf-8"))
+
+        # Capture old content for in-memory revert (Tier 2 + YAML files only)
+        old_content: str | None = None
+        if file_exists and (is_tier_2 or is_yaml):
+            try:
+                old_content = await hass.async_add_executor_job(target_file.read_text)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Could not read old content of %s for revert snapshot: %s",
+                    rel_path, exc,
+                )
+                # Carry on without revert capability rather than blocking the write.
+
+        # Overwrite gate
+        if file_exists and not overwrite:
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=False, is_tier_2=is_tier_2, dry_run=dry_run,
+                error="overwrite_required",
+            )
             return {
                 "success": False,
                 "error": f"File already exists: {rel_path}. Set overwrite=true to replace.",
             }
 
+        # Phase 2: size-delta guard
+        if (
+            file_exists
+            and old_size > 0
+            and new_size < old_size * SIZE_DELTA_GUARD_THRESHOLD
+            and not force_shrink
+        ):
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=False, is_tier_2=is_tier_2, dry_run=dry_run,
+                error="size_delta_guard",
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Size-delta guard: new size {new_size} is less than "
+                    f"{int(SIZE_DELTA_GUARD_THRESHOLD * 100)}% of old size {old_size}. "
+                    "Pass force_shrink=true to override (e.g. for legitimate "
+                    "large deletions). This guard catches the runaway-truncation "
+                    "class of bug."
+                ),
+                "old_size": old_size,
+                "new_size": new_size,
+                "size_delta_pct": ((new_size - old_size) / old_size) * 100,
+            }
+
+        # Phase 2: dry_run preview
+        if dry_run:
+            preview: dict[str, Any] = {
+                "success": True,
+                "dry_run": True,
+                "would_write": rel_path,
+                "would_create": not file_exists,
+                "would_overwrite": file_exists,
+                "old_size": old_size,
+                "new_size": new_size,
+                "size_delta": new_size - old_size,
+                "size_delta_pct": (
+                    ((new_size - old_size) / old_size) * 100
+                    if old_size > 0
+                    else None
+                ),
+                "is_tier_2": is_tier_2,
+            }
+            if is_yaml:
+                ry = make_yaml()
+                try:
+                    ry.load(StringIO(content))
+                    preview["yaml_parse"] = "ok"
+                except YAMLError as err:
+                    preview["yaml_parse"] = "error"
+                    preview["yaml_parse_error"] = str(err)
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=True, is_tier_2=is_tier_2, dry_run=True,
+            )
+            return preview
+
         try:
-            # Create parent directories if needed
             if create_dirs:
                 await hass.async_add_executor_job(
                     lambda: target_file.parent.mkdir(parents=True, exist_ok=True)
                 )
 
-            # Check parent directory exists
             if not target_file.parent.exists():
+                await _audit_write(
+                    hass, config_dir,
+                    service="write_file", path=rel_path,
+                    old_size=old_size, new_size=new_size,
+                    success=False, is_tier_2=is_tier_2, dry_run=False,
+                    error="parent_missing",
+                )
                 return {
                     "success": False,
-                    "error": f"Parent directory does not exist: {target_file.parent.relative_to(config_dir)}",
+                    "error": (
+                        f"Parent directory does not exist: "
+                        f"{target_file.parent.relative_to(config_dir)}"
+                    ),
                 }
 
-            # Determine if this is a new file
-            is_new = not target_file.exists()
+            # Phase 2: text backup for Tier 2 paths (matches edit_yaml_config pattern)
+            backup_path_str: str | None = None
+            if is_tier_2 and old_content is not None:
+                backup_dir = config_dir / "www" / "yaml_backups"
+                await hass.async_add_executor_job(
+                    lambda: backup_dir.mkdir(parents=True, exist_ok=True)
+                )
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_name = normalized.replace(os.sep, "_")
+                backup_file = backup_dir / f"{safe_name}.{timestamp}.bak"
+                await hass.async_add_executor_job(backup_file.write_text, old_content)
+                backup_path_str = str(backup_file.relative_to(config_dir))
+                _LOGGER.info("Pre-write text backup created: %s", backup_path_str)
 
-            # Write the file
-            await hass.async_add_executor_job(target_file.write_text, content)
+            is_new = not file_exists
+
+            # Phase 2: atomic write (was direct write_text)
+            await _atomic_write_text(hass, target_file, content)
 
             stat = target_file.stat()
             modified_dt = datetime.fromtimestamp(stat.st_mtime)
 
-            _LOGGER.info("Wrote file: %s (%d bytes)", rel_path, stat.st_size)
-
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "path": rel_path,
                 "size": stat.st_size,
                 "modified": modified_dt.isoformat(),
                 "created": is_new,
+                "is_tier_2": is_tier_2,
                 "message": f"File {'created' if is_new else 'updated'} successfully",
             }
+            if backup_path_str:
+                result["backup_path"] = backup_path_str
+
+            # Phase 2: YAML post-write parse validation
+            if is_yaml:
+                ry = make_yaml()
+                try:
+                    ry.load(StringIO(content))
+                    result["yaml_parse"] = "ok"
+                except YAMLError as err:
+                    result["yaml_parse"] = "error"
+                    result["yaml_parse_error"] = str(err)
+                    if auto_revert and old_content is not None:
+                        await _atomic_write_text(hass, target_file, old_content)
+                        result["auto_reverted"] = True
+                        result["success"] = False
+                        result["error"] = (
+                            f"YAML parse failed after write; auto-reverted from "
+                            f"in-memory snapshot. Pre-revert error: {err}"
+                        )
+                        _LOGGER.warning(
+                            "Auto-reverted %s: YAML parse error: %s", rel_path, err,
+                        )
+
+            # Phase 2: Tier 2 post-write check_config
+            if is_tier_2 and result.get("success"):
+                try:
+                    check_result = await hass.services.async_call(
+                        "homeassistant", "check_config", {},
+                        blocking=True, return_response=True,
+                    )
+                    if isinstance(check_result, dict):
+                        errors = check_result.get("errors")
+                        if errors:
+                            result["config_check"] = "errors"
+                            result["config_check_errors"] = errors
+                            if auto_revert and old_content is not None:
+                                await _atomic_write_text(
+                                    hass, target_file, old_content,
+                                )
+                                result["auto_reverted"] = True
+                                result["success"] = False
+                                result["error"] = (
+                                    f"check_config failed after write; "
+                                    f"auto-reverted from in-memory snapshot. "
+                                    f"Errors: {errors}"
+                                )
+                                _LOGGER.warning(
+                                    "Auto-reverted %s: check_config errors: %s",
+                                    rel_path, errors,
+                                )
+                        else:
+                            result["config_check"] = "ok"
+                except Exception as check_err:  # noqa: BLE001
+                    result["config_check"] = "unavailable"
+                    result["config_check_error"] = str(check_err)
+                    _LOGGER.debug("Config check unavailable: %s", check_err)
+
+            _LOGGER.info(
+                "Wrote file: %s (%d bytes, tier_2=%s, success=%s)",
+                rel_path, stat.st_size, is_tier_2, result["success"],
+            )
+
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=result["success"], is_tier_2=is_tier_2, dry_run=False,
+                error=result.get("error"),
+                extra={
+                    "auto_reverted": result.get("auto_reverted", False),
+                    "yaml_parse": result.get("yaml_parse"),
+                    "config_check": result.get("config_check"),
+                },
+            )
+
+            return result
 
         except PermissionError:
             _LOGGER.error("Permission denied writing: %s", rel_path)
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=False, is_tier_2=is_tier_2, dry_run=False,
+                error="permission_denied",
+            )
             return {
                 "success": False,
                 "error": f"Permission denied: {rel_path}",
             }
         except OSError as err:
             _LOGGER.error("Error writing file %s: %s", rel_path, err)
+            await _audit_write(
+                hass, config_dir,
+                service="write_file", path=rel_path,
+                old_size=old_size, new_size=new_size,
+                success=False, is_tier_2=is_tier_2, dry_run=False,
+                error=str(err),
+            )
             return {
                 "success": False,
                 "error": str(err),
@@ -498,16 +863,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Handle the delete_file service call."""
         rel_path = call.data["path"]
 
-        # Security check - only allow deletes from specific directories
-        if not _is_path_allowed_for_dir(
-            config_dir, rel_path, ALLOWED_WRITE_DIRS, ALLOWED_WRITE_PATTERNS
-        ):
+        if not _is_path_allowed_for_write(config_dir, rel_path):
             _LOGGER.warning("Attempted to delete from disallowed path: %s", rel_path)
             return {
                 "success": False,
                 "error": (
                     f"Delete not allowed. Must be in: {', '.join(ALLOWED_WRITE_DIRS)}"
-                    f" or match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                    f", match: {', '.join(ALLOWED_WRITE_PATTERNS)}"
+                    f", or be one of: {', '.join(ALLOWED_WRITE_FILES)}"
                 ),
             }
 
@@ -526,13 +889,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
 
         try:
-            # Get file info before deletion for the response
             stat = target_file.stat()
-
-            # Delete the file
             await hass.async_add_executor_job(target_file.unlink)
 
             _LOGGER.info("Deleted file: %s (%d bytes)", rel_path, stat.st_size)
+
+            await _audit_write(
+                hass, config_dir,
+                service="delete_file", path=rel_path,
+                old_size=stat.st_size, new_size=0,
+                success=True, is_tier_2=_is_tier_2(rel_path), dry_run=False,
+            )
 
             return {
                 "success": True,
@@ -555,16 +922,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
 
     async def handle_edit_yaml_config(call: ServiceCall) -> ServiceResponse:
-        """Handle the edit_yaml_config service call."""
+        """Handle the edit_yaml_config service call.
+
+        Phase 2 enhancements:
+        - dry_run mode: parse, apply transform, validate output, return preview
+          including before/after top-level keys without writing.
+        - auto_revert (default True): on check_config errors, restore the
+          original content from the in-memory raw_content snapshot via
+          atomic write. No HA restart, no backup-restore race conditions.
+        - JSONL audit log entry per call.
+        """
         ry = make_yaml()
         rel_path = call.data["file"]
         action = call.data["action"]
         yaml_path = call.data["yaml_path"]
         content = call.data.get("content")
         do_backup = call.data.get("backup", True)
+        # Phase 2 parameters:
+        dry_run = call.data.get("dry_run", False)
+        auto_revert = call.data.get("auto_revert", True)
 
-        # Validate file path — only configuration.yaml and packages/*.yaml
         normalized = os.path.normpath(rel_path)  # noqa: ASYNC240
+        is_tier_2 = _is_tier_2(normalized)
+
         if normalized.startswith("..") or normalized.startswith("/"):
             return {
                 "success": False,
@@ -580,11 +960,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "success": False,
                 "error": (
                     f"File '{rel_path}' is not allowed. "
-                    f"Only {', '.join(ALLOWED_YAML_CONFIG_FILES)} and packages/*.yaml are supported."
+                    f"Only {', '.join(ALLOWED_YAML_CONFIG_FILES)} and "
+                    f"packages/*.yaml are supported."
                 ),
             }
 
-        # Validate yaml_path against allowlist
         if yaml_path not in ALLOWED_YAML_KEYS:
             return {
                 "success": False,
@@ -594,7 +974,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ),
             }
 
-        # Validate content is valid YAML for add/replace
         parsed_content: Any = None
         if action in ("add", "replace"):
             if not content:
@@ -617,9 +996,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         target_file = config_dir / normalized
         backup_path_str: str | None = None
+        raw_content = ""
 
         try:
-            # Read existing file content (or start with empty dict)
+            # Read existing content
             if target_file.exists():
                 raw_content = await hass.async_add_executor_job(target_file.read_text)
                 try:
@@ -643,26 +1023,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 data = {}
                 raw_content = ""
 
-            # Create backup before editing (from already-read content, not disk)
-            if do_backup and raw_content:
-                backup_dir = config_dir / "www" / "yaml_backups"
-                await hass.async_add_executor_job(
-                    lambda: backup_dir.mkdir(parents=True, exist_ok=True)
-                )
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_name = normalized.replace(os.sep, "_")
-                backup_file = backup_dir / f"{safe_name}.{timestamp}.bak"
-                await hass.async_add_executor_job(
-                    backup_file.write_text, raw_content
-                )
-                backup_path_str = str(backup_file.relative_to(config_dir))
-                _LOGGER.info("Backup created: %s", backup_path_str)
+            # Capture pre-edit top-level keys for dry_run reporting
+            keys_before = sorted(data.keys()) if data else []
 
-            # Perform the action
+            # Apply the action (in-memory)
             if action == "add":
                 if yaml_path in data:
                     existing = data[yaml_path]
-                    # Merge: list extends list, dict merges dict
                     if isinstance(existing, list) and isinstance(parsed_content, list):
                         data[yaml_path] = existing + parsed_content
                     elif isinstance(existing, dict) and isinstance(
@@ -691,6 +1058,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     }
                 del data[yaml_path]
 
+            keys_after = sorted(data.keys()) if data else []
+
             # Serialize back to YAML
             try:
                 new_content = yaml_dumps(ry, data)
@@ -709,28 +1078,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "error": f"Generated YAML failed validation: {err}",
                 }
 
-            # Create parent directories if needed (for new package files)
+            # Phase 2: dry_run preview
+            if dry_run:
+                preview: dict[str, Any] = {
+                    "success": True,
+                    "dry_run": True,
+                    "file": rel_path,
+                    "action": action,
+                    "yaml_path": yaml_path,
+                    "old_size": len(raw_content.encode("utf-8")),
+                    "new_size": len(new_content.encode("utf-8")),
+                    "keys_before": keys_before,
+                    "keys_after": keys_after,
+                    "keys_added": sorted(set(keys_after) - set(keys_before)),
+                    "keys_removed": sorted(set(keys_before) - set(keys_after)),
+                    "is_tier_2": is_tier_2,
+                }
+                preview.update(
+                    YAML_KEY_POST_ACTIONS.get(yaml_path, YAML_KEY_DEFAULT_POST_ACTION)
+                )
+                await _audit_write(
+                    hass, config_dir,
+                    service="edit_yaml_config", path=rel_path,
+                    old_size=preview["old_size"], new_size=preview["new_size"],
+                    success=True, is_tier_2=is_tier_2, dry_run=True,
+                    extra={"action": action, "yaml_path": yaml_path},
+                )
+                return preview
+
+            # Pre-write text backup
+            if do_backup and raw_content:
+                backup_dir = config_dir / "www" / "yaml_backups"
+                await hass.async_add_executor_job(
+                    lambda: backup_dir.mkdir(parents=True, exist_ok=True)
+                )
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_name = normalized.replace(os.sep, "_")
+                backup_file = backup_dir / f"{safe_name}.{timestamp}.bak"
+                await hass.async_add_executor_job(
+                    backup_file.write_text, raw_content
+                )
+                backup_path_str = str(backup_file.relative_to(config_dir))
+                _LOGGER.info("Backup created: %s", backup_path_str)
+
+            # Create parent dirs for new package files
             if not target_file.parent.exists():
                 await hass.async_add_executor_job(
                     lambda: target_file.parent.mkdir(parents=True, exist_ok=True)
                 )
 
-            # Atomic write: write to temp file, then rename into place
-            def _atomic_write() -> None:
-                tmp_file = target_file.with_suffix(".tmp")
-                tmp_file.write_text(new_content)
-                os.replace(str(tmp_file), str(target_file))
-
-            await hass.async_add_executor_job(_atomic_write)
+            # Atomic write
+            await _atomic_write_text(hass, target_file, new_content)
 
             stat = target_file.stat()
             modified_dt = datetime.fromtimestamp(stat.st_mtime)
 
             _LOGGER.info(
                 "YAML config edited: %s (action=%s, key=%s)",
-                rel_path,
-                action,
-                yaml_path,
+                rel_path, action, yaml_path,
             )
 
             result: dict[str, Any] = {
@@ -740,52 +1145,96 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "yaml_path": yaml_path,
                 "size": stat.st_size,
                 "modified": modified_dt.isoformat(),
+                "is_tier_2": is_tier_2,
             }
             if backup_path_str:
                 result["backup_path"] = backup_path_str
 
-            # Surface the post-edit action required to activate the change
             post_info = YAML_KEY_POST_ACTIONS.get(
                 yaml_path, YAML_KEY_DEFAULT_POST_ACTION
             )
             result.update(post_info)
 
-            # Run HA config check to verify the file is loadable
+            # Run HA config check
             try:
                 check_result = await hass.services.async_call(
-                    "homeassistant",
-                    "check_config",
-                    {},
-                    blocking=True,
-                    return_response=True,
+                    "homeassistant", "check_config", {},
+                    blocking=True, return_response=True,
                 )
                 if isinstance(check_result, dict):
                     errors = check_result.get("errors")
                     if errors:
                         result["config_check"] = "errors"
                         result["config_check_errors"] = errors
-                        _LOGGER.warning(
-                            "Config check found errors after editing %s: %s",
-                            rel_path,
-                            errors,
-                        )
+                        # Phase 2: auto-revert from raw_content snapshot
+                        if auto_revert and raw_content:
+                            await _atomic_write_text(
+                                hass, target_file, raw_content,
+                            )
+                            result["auto_reverted"] = True
+                            result["success"] = False
+                            result["error"] = (
+                                f"check_config failed after edit; auto-reverted "
+                                f"from in-memory snapshot. Errors: {errors}"
+                            )
+                            _LOGGER.warning(
+                                "Auto-reverted %s: check_config errors: %s",
+                                rel_path, errors,
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "Config check found errors after editing %s "
+                                "(auto_revert=%s): %s",
+                                rel_path, auto_revert, errors,
+                            )
                     else:
                         result["config_check"] = "ok"
-            except Exception as check_err:
+            except Exception as check_err:  # noqa: BLE001
                 result["config_check"] = "unavailable"
                 result["config_check_error"] = str(check_err)
                 _LOGGER.debug("Config check unavailable: %s", check_err)
+
+            await _audit_write(
+                hass, config_dir,
+                service="edit_yaml_config", path=rel_path,
+                old_size=len(raw_content.encode("utf-8")),
+                new_size=stat.st_size,
+                success=result["success"], is_tier_2=is_tier_2, dry_run=False,
+                error=result.get("error"),
+                extra={
+                    "action": action,
+                    "yaml_path": yaml_path,
+                    "auto_reverted": result.get("auto_reverted", False),
+                    "config_check": result.get("config_check"),
+                },
+            )
 
             return result
 
         except PermissionError:
             _LOGGER.error("Permission denied editing: %s", rel_path)
+            await _audit_write(
+                hass, config_dir,
+                service="edit_yaml_config", path=rel_path,
+                old_size=len(raw_content.encode("utf-8")) if raw_content else 0,
+                new_size=None,
+                success=False, is_tier_2=is_tier_2, dry_run=False,
+                error="permission_denied",
+            )
             return {
                 "success": False,
                 "error": f"Permission denied: {rel_path}",
             }
         except OSError as err:
             _LOGGER.error("Error editing YAML config %s: %s", rel_path, err)
+            await _audit_write(
+                hass, config_dir,
+                service="edit_yaml_config", path=rel_path,
+                old_size=len(raw_content.encode("utf-8")) if raw_content else 0,
+                new_size=None,
+                success=False, is_tier_2=is_tier_2, dry_run=False,
+                error=str(err),
+            )
             return {
                 "success": False,
                 "error": str(err),
@@ -832,13 +1281,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
-    _LOGGER.info("HA MCP Tools initialized with file management services")
+    _LOGGER.info("HA MCP Tools initialized with file management services (Phase 2)")
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    # Remove all services
     hass.services.async_remove(DOMAIN, SERVICE_EDIT_YAML_CONFIG)
     hass.services.async_remove(DOMAIN, SERVICE_LIST_FILES)
     hass.services.async_remove(DOMAIN, SERVICE_READ_FILE)
